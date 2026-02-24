@@ -1584,6 +1584,120 @@ static std::string handle_get_markers()
     return "OK " + json;
 }
 
+static uint32_t color_code_to_native(const std::string& colorCode)
+{
+    int a = 0, b = 0, c = 0;
+    if (std::sscanf(colorCode.c_str(), "%d,%d,%d", &a, &b, &c) == 3)
+    {
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        if (b < 0) b = 0;
+        if (b > 255) b = 255;
+        if (c < 0) c = 0;
+        if (c > 255) c = 255;
+        return ColorToNative(a, b, c) | 0x1000000;
+    }
+    return ColorToNative(255, 255, 255) | 0x1000000;
+}
+
+static int find_marker_enum_index_by_idnum(ReaProject* proj, int markerIdNum)
+{
+    int numMarkers = 0;
+    int numRegions = 0;
+    CountProjectMarkers(proj, &numMarkers, &numRegions);
+    const int total = numMarkers + numRegions;
+    for (int i = 0; i < total; ++i)
+    {
+        bool isrgn = false;
+        double pos = 0.0, end = 0.0;
+        const char* name = nullptr;
+        int idnum = 0, color = 0;
+        if (!EnumProjectMarkers3(proj, i, &isrgn, &pos, &end, &name, &idnum, &color))
+            continue;
+        if (isrgn)
+            continue;
+        if (idnum == markerIdNum)
+            return i;
+    }
+    return -1;
+}
+
+static std::string handle_get_playhead()
+{
+    ReaProject* proj = EnumProjects(-1, nullptr, 0);
+    if (!proj)
+        return "ERR NoProject";
+    const double playheadSec = GetCursorPosition();
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "OK {\"playhead_sec\":%.6f}", playheadSec < 0.0 ? 0.0 : playheadSec);
+    return std::string(buf);
+}
+
+static std::string handle_create_note_marker(const std::string& json)
+{
+    ReaProject* proj = EnumProjects(-1, nullptr, 0);
+    if (!proj)
+        return "ERR NoProject";
+
+    std::string name = json_extract_string(json, "name");
+    if (name.empty())
+        name = "USER: Note";
+    double posSec = json_extract_number(json, "pos_sec", 0.0);
+    if (posSec < 0.0)
+        posSec = 0.0;
+    std::string colorCode = trim(json_extract_string(json, "color_code"));
+    if (colorCode.empty())
+        colorCode = "0,0,1";
+    const uint32_t colorNative = color_code_to_native(colorCode);
+
+    const int markerId = AddProjectMarker2(proj, false, posSec, 0.0, name.c_str(), -1, colorNative);
+    if (markerId < 0)
+        return "ERR MarkerCreateFailed";
+
+    const int enumIdx = find_marker_enum_index_by_idnum(proj, markerId);
+    std::string guid;
+    if (enumIdx >= 0)
+        guid = marker_guid_for_index(proj, enumIdx);
+
+    char out[1024];
+    std::snprintf(
+        out,
+        sizeof(out),
+        "OK {\"idnum\":%d,\"guid\":\"%s\",\"pos_sec\":%.6f,\"name\":\"%s\",\"color_code\":\"%s\"}",
+        markerId,
+        escape_json_string(guid).c_str(),
+        posSec,
+        escape_json_string(name).c_str(),
+        escape_json_string(colorCode).c_str()
+    );
+    return std::string(out);
+}
+
+static std::string handle_goto_and_play(const std::string& json)
+{
+    ReaProject* proj = EnumProjects(-1, nullptr, 0);
+    if (!proj)
+        return "ERR NoProject";
+
+    double targetSec = json_extract_number(json, "target_sec", 0.0);
+    double prerollSec = json_extract_number(json, "preroll_sec", 0.0);
+    if (targetSec < 0.0)
+        targetSec = 0.0;
+    if (prerollSec < 0.0)
+        prerollSec = 0.0;
+    double startSec = targetSec - prerollSec;
+    if (startSec < 0.0)
+        startSec = 0.0;
+
+    OnStopButton();
+    SetEditCurPos2(proj, startSec, true, false);
+    OnPlayButton();
+
+    char out[256];
+    std::snprintf(out, sizeof(out), "OK {\"start_sec\":%.6f,\"target_sec\":%.6f}", startSec, targetSec);
+    return std::string(out);
+}
+
 //==============================================================
 // Import events from MA3
 //==============================================================
@@ -1934,6 +2048,21 @@ static void my_timer()
         {
             responded = true;
             response = handle_get_markers();
+        }
+        else if (verb == "RS_GET_PLAYHEAD")
+        {
+            responded = true;
+            response = handle_get_playhead();
+        }
+        else if (verb == "RS_CREATE_NOTE_MARKER")
+        {
+            responded = true;
+            response = handle_create_note_marker(args);
+        }
+        else if (verb == "RS_GOTO_AND_PLAY")
+        {
+            responded = true;
+            response = handle_goto_and_play(args);
         }
         else if (verb == "RS_EXTSTATE_GET_ZRS_LINKS")
         {
