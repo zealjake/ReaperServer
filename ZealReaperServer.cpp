@@ -17,6 +17,7 @@
 #define REAPERAPI_WANT_OnPauseButton
 #define REAPERAPI_WANT_SetEditCurPos2
 #define REAPERAPI_WANT_GetCursorPosition
+#define REAPERAPI_WANT_GetPlayPositionEx
 #define REAPERAPI_WANT_GetSet_LoopTimeRange2
 #define REAPERAPI_WANT_TimeMap_curFrameRate
 #define REAPERAPI_WANT_AddProjectMarker2
@@ -32,6 +33,7 @@
 #define REAPERAPI_WANT_GetResourcePath
 #define REAPERAPI_WANT_GetProjectPath
 #define REAPERAPI_WANT_GetSetMediaTrackInfo_String
+#define REAPERAPI_WANT_SetMediaTrackInfo_Value
 #define REAPERAPI_WANT_InsertTrackAtIndex
 #define REAPERAPI_WANT_GetTrack
 #define REAPERAPI_WANT_AddMediaItemToTrack
@@ -64,6 +66,7 @@
 #define REAPERAPI_WANT_GetMediaTrackInfo_Value
 #define REAPERAPI_WANT_ColorFromNative
 #define REAPERAPI_WANT_GetTrackMIDINoteNameEx
+#define REAPERAPI_WANT_GetPlayStateEx
 
 #include "reaper_plugin.h"
 #include "reaper_plugin_functions.h"
@@ -85,6 +88,8 @@
 #include <fstream>
 #include <ctime>
 #include <cctype>
+#include <chrono>
+#include <algorithm>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -103,6 +108,10 @@ static std::atomic<int>  g_listenSock{-1};
 static std::atomic<int>  g_udpSock{-1};
 static std::thread       g_serverThread;
 static std::thread       g_udpThread;
+static std::mutex        g_markerSubscriberMutex;
+static std::vector<int>  g_markerSubscribers;
+static std::string       g_lastMarkerSnapshotJson = "[]";
+static std::chrono::steady_clock::time_point g_lastMarkerBroadcastAt;
 
 struct QueuedCommand
 {
@@ -348,6 +357,36 @@ static bool command_needs_response(const std::string& raw)
     return (verb.rfind("RS_", 0) == 0) || (verb == "GetTimeSelection") || (verb == "GetTimeSelectionRange");
 }
 
+static bool is_marker_subscription_command(const std::string& raw)
+{
+    std::string verb = raw;
+    size_t sp = raw.find(' ');
+    if (sp != std::string::npos)
+        verb = raw.substr(0, sp);
+    return verb == "RS_SUBSCRIBE_MARKERS";
+}
+
+static void add_marker_subscriber(int client_fd)
+{
+    std::lock_guard<std::mutex> lock(g_markerSubscriberMutex);
+    if (std::find(g_markerSubscribers.begin(), g_markerSubscribers.end(), client_fd) == g_markerSubscribers.end())
+        g_markerSubscribers.push_back(client_fd);
+}
+
+static void remove_marker_subscriber(int client_fd)
+{
+    std::lock_guard<std::mutex> lock(g_markerSubscriberMutex);
+    g_markerSubscribers.erase(
+        std::remove(g_markerSubscribers.begin(), g_markerSubscribers.end(), client_fd),
+        g_markerSubscribers.end()
+    );
+}
+
+static std::string format_marker_event_line(const std::string& json)
+{
+    return "EVENT MARKERS " + json;
+}
+
 static void enqueue_command(const std::shared_ptr<QueuedCommand>& cmd)
 {
     std::lock_guard<std::mutex> lock(g_cmdMutex);
@@ -488,14 +527,26 @@ static std::string json_extract_string(const std::string& json, const std::strin
     if (pos == std::string::npos) return {};
     pos = json.find(':', pos);
     if (pos == std::string::npos) return {};
-    pos = json.find_first_not_of(" \t\"", pos + 1);
+    pos = json.find_first_not_of(" \t", pos + 1);
     if (pos == std::string::npos) return {};
-    bool quoted = json[pos] == '"';
-    if (quoted) pos += 0;
-    size_t start = quoted ? pos + 1 : pos;
-    size_t end = quoted ? json.find('"', start) : json.find_first_of(",}", start);
-    if (end == std::string::npos) end = json.size();
-    return json.substr(start, end - start);
+    if (json[pos] == '"')
+    {
+        size_t start = pos + 1;
+        size_t end = start;
+        while (end < json.size())
+        {
+            if (json[end] == '"' && (end == start || json[end - 1] != '\\'))
+                break;
+            ++end;
+        }
+        if (end == std::string::npos || end >= json.size())
+            end = json.size();
+        return json.substr(start, end - start);
+    }
+    size_t end = json.find_first_of(",}", pos);
+    if (end == std::string::npos)
+        end = json.size();
+    return trim(json.substr(pos, end - pos));
 }
 
 static double json_extract_number(const std::string& json, const std::string& key, double def = 0.0)
@@ -508,6 +559,22 @@ static double json_extract_number(const std::string& json, const std::string& ke
     pos = json.find_first_of("0123456789-.", pos + 1);
     if (pos == std::string::npos) return def;
     return std::atof(json.c_str() + pos);
+}
+
+static bool json_extract_bool(const std::string& json, const std::string& key, bool def = false)
+{
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return def;
+    pos = json.find(':', pos);
+    if (pos == std::string::npos) return def;
+    pos = json.find_first_not_of(" \t", pos + 1);
+    if (pos == std::string::npos) return def;
+    if (json.compare(pos, 4, "true") == 0) return true;
+    if (json.compare(pos, 5, "false") == 0) return false;
+    if (json[pos] == '1') return true;
+    if (json[pos] == '0') return false;
+    return def;
 }
 
 static std::string json_extract_object(const std::string& json, const std::string& key)
@@ -925,6 +992,218 @@ static std::string handle_get_project_snapshot(const std::string& json)
     return std::string("OK ") + buf;
 }
 
+static bool iequals(const std::string& a, const std::string& b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+            return false;
+    }
+    return true;
+}
+
+static std::string current_project_display_name(ReaProject* proj)
+{
+    if (!proj)
+        return {};
+    char nameBuf[512] = {0};
+    GetSetProjectInfo_String(proj, "PROJECT_NAME", nameBuf, false);
+    std::string name = trim(nameBuf);
+    if (!name.empty())
+        return name;
+    char pathBuf[4096] = {0};
+    EnumProjects(-1, pathBuf, sizeof(pathBuf));
+    std::filesystem::path p(pathBuf);
+    return p.stem().string();
+}
+
+static ReaProject* find_open_project_by_name_select(const std::string& projectName)
+{
+    const std::string want = trim(projectName);
+    if (want.empty())
+        return nullptr;
+    char pathBuf[4096] = {0};
+    for (int i = 0;; ++i)
+    {
+        ReaProject* p = EnumProjects(i, pathBuf, sizeof(pathBuf));
+        if (!p)
+            break;
+        char nameBuf[512] = {0};
+        GetSetProjectInfo_String(p, "PROJECT_NAME", nameBuf, false);
+        const std::string displayName = trim(nameBuf);
+        if (!displayName.empty() && iequals(displayName, want))
+        {
+            SelectProjectInstance(p);
+            return p;
+        }
+        const std::string stem = std::filesystem::path(pathBuf).stem().string();
+        if (!stem.empty() && iequals(stem, want))
+        {
+            SelectProjectInstance(p);
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+static ReaProject* resolve_project_select(const std::string& json)
+{
+    std::string projectGuid = trim_quotes(json_extract_string(json, "projectGuid"));
+    std::string projectPath = trim_quotes(json_extract_string(json, "projectPath"));
+    std::string projectName = trim_quotes(json_extract_string(json, "projectName"));
+    ReaProject* proj = nullptr;
+    if (!projectGuid.empty())
+        proj = find_open_project_by_guid(projectGuid);
+    if (!proj && !projectPath.empty())
+    {
+        proj = find_open_project_by_path_select(projectPath);
+        if (!proj && std::filesystem::exists(projectPath))
+            proj = open_or_select_project(projectPath);
+    }
+    if (!proj && !projectName.empty())
+        proj = find_open_project_by_name_select(projectName);
+    if (!proj)
+        proj = EnumProjects(-1, nullptr, 0);
+    return proj;
+}
+
+static std::string handle_find_project(const std::string& json)
+{
+    ReaProject* proj = resolve_project_select(json);
+    if (!proj)
+        return "ERR NoProject";
+    char pathBuf[4096] = {0};
+    EnumProjects(-1, pathBuf, sizeof(pathBuf));
+    char guidBuf[256] = {0};
+    GetProjExtState(proj, "ZealReaperSync", "projectGuid", guidBuf, sizeof(guidBuf));
+    std::string projectName = current_project_display_name(proj);
+    char out[8192];
+    std::snprintf(
+        out,
+        sizeof(out),
+        "OK {\"project_guid\":\"%s\",\"project_path\":\"%s\",\"project_name\":\"%s\"}",
+        escape_json_string(std::string(guidBuf)).c_str(),
+        escape_json_string(std::string(pathBuf)).c_str(),
+        escape_json_string(projectName).c_str()
+    );
+    return std::string(out);
+}
+
+static MediaTrack* find_track_case_insensitive(ReaProject* proj, const std::string& targetName)
+{
+    if (!proj)
+        return nullptr;
+    const int count = CountTracks(proj);
+    char buf[512];
+    for (int i = 0; i < count; ++i)
+    {
+        MediaTrack* tr = GetTrack(proj, i);
+        if (!tr) continue;
+        buf[0] = 0;
+        GetSetMediaTrackInfo_String(tr, "P_NAME", buf, false);
+        if (iequals(trim(buf), trim(targetName)))
+            return tr;
+    }
+    return nullptr;
+}
+
+static void disarm_all_tracks(ReaProject* proj)
+{
+    if (!proj || !SetMediaTrackInfo_Value)
+        return;
+    const int count = CountTracks(proj);
+    for (int i = 0; i < count; ++i)
+    {
+        MediaTrack* tr = GetTrack(proj, i);
+        if (!tr) continue;
+        SetMediaTrackInfo_Value(tr, "I_RECARM", 0.0);
+    }
+}
+
+static bool is_recording_now(ReaProject* proj)
+{
+    if (!proj || !GetPlayStateEx)
+        return false;
+    int state = GetPlayStateEx(proj);
+    return (state & 4) != 0;
+}
+
+static std::string handle_arm_rehearsal(const std::string& json)
+{
+    ReaProject* proj = resolve_project_select(json);
+    if (!proj)
+        return "ERR NoProject";
+
+    std::string trackA = trim_quotes(json_extract_string(json, "trackA"));
+    std::string trackB = trim_quotes(json_extract_string(json, "trackB"));
+    if (trackA.empty()) trackA = "TC Record";
+    if (trackB.empty()) trackB = "TRACK Record";
+
+    MediaTrack* trA = find_track_case_insensitive(proj, trackA);
+    MediaTrack* trB = find_track_case_insensitive(proj, trackB);
+    if (!trA || !trB)
+        return "ERR MissingRecordTracks";
+
+    disarm_all_tracks(proj);
+    SetMediaTrackInfo_Value(trA, "I_RECARM", 1.0);
+    SetMediaTrackInfo_Value(trB, "I_RECARM", 1.0);
+    if (!is_recording_now(proj))
+        Main_OnCommand(1013, 0); // Transport: Record
+    UpdateTimeline();
+    return "OK";
+}
+
+static std::string handle_stop_rehearsal(const std::string& json)
+{
+    ReaProject* proj = resolve_project_select(json);
+    if (!proj)
+        return "ERR NoProject";
+    if (is_recording_now(proj))
+        OnStopButton();
+    Main_SaveProject(proj, false);
+    UpdateTimeline();
+    return "OK";
+}
+
+static std::string handle_set_rehearsal_mode(const std::string& json)
+{
+    ReaProject* proj = resolve_project_select(json);
+    if (!proj)
+        return "ERR NoProject";
+    const bool enabled = json_extract_bool(json, "enabled", false);
+    const int actionId = (int)json_extract_number(json, "actionId", 0.0);
+    SetProjExtState(proj, "ZealReaperSync", "rehearsalMode", enabled ? "1" : "0");
+    if (actionId > 0)
+        Main_OnCommand(actionId, 0);
+    Main_SaveProject(proj, false);
+    return "OK";
+}
+
+static std::string handle_import_video_to_track(const std::string& json)
+{
+    ReaProject* proj = resolve_project_select(json);
+    if (!proj)
+        return "ERR NoProject";
+    std::string videoPath = trim_quotes(json_extract_string(json, "videoPath"));
+    if (videoPath.empty())
+        return "ERR MissingVideoPath";
+    if (!std::filesystem::exists(videoPath))
+        return "ERR VideoNotFound";
+    std::string trackName = trim_quotes(json_extract_string(json, "trackName"));
+    if (trackName.empty())
+        trackName = "Video";
+    MediaTrack* tr = find_track_case_insensitive(proj, trackName);
+    if (!tr)
+        tr = find_or_create_track(proj, {trackName});
+    if (!tr)
+        return "ERR MissingVideoTrack";
+    replace_track_items(proj, tr, videoPath);
+    Main_SaveProject(proj, false);
+    return "OK";
+}
+
 //==============================================================
 // MIDI note export (for MA3 sync)
 //==============================================================
@@ -969,23 +1248,88 @@ static std::string color_native_to_hex(int nativeColor)
     return std::string(buf);
 }
 
+static std::string color_native_to_code(int nativeColor)
+{
+    if (nativeColor == 0)
+        return "";
+    int c = nativeColor & 0x00FFFFFF;
+    int r = 255, g = 255, b = 255;
+    if (ColorFromNative)
+        ColorFromNative(c, &r, &g, &b);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d,%d,%d", r & 0xFF, g & 0xFF, b & 0xFF);
+    return std::string(buf);
+}
+
+static std::string project_path_for_project(ReaProject* proj)
+{
+    if (!proj)
+        return {};
+    char pathBuf[4096] = {0};
+    for (int i = 0;; ++i)
+    {
+        ReaProject* p = EnumProjects(i, pathBuf, sizeof(pathBuf));
+        if (!p)
+            break;
+        if (p == proj)
+            return std::string(pathBuf);
+    }
+    return {};
+}
+
+static std::unordered_map<int, std::string> marker_guid_map_from_project_file(const std::string& projectPath)
+{
+    std::unordered_map<int, std::string> out;
+    if (projectPath.empty())
+        return out;
+    std::ifstream in(projectPath);
+    if (!in.is_open())
+        return out;
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        const std::string t = trim(line);
+        if (t.rfind("MARKER ", 0) != 0)
+            continue;
+
+        const size_t idStart = 7;
+        size_t idEnd = idStart;
+        while (idEnd < t.size() && std::isdigit((unsigned char)t[idEnd]))
+            ++idEnd;
+        if (idEnd <= idStart)
+            continue;
+        const int id = std::atoi(t.substr(idStart, idEnd - idStart).c_str());
+        if (id <= 0)
+            continue;
+
+        const size_t braceOpen = t.rfind('{');
+        const size_t braceClose = t.rfind('}');
+        if (braceOpen == std::string::npos || braceClose == std::string::npos || braceClose <= braceOpen)
+            continue;
+        const std::string guid = t.substr(braceOpen + 1, braceClose - braceOpen - 1);
+        if (!guid.empty())
+            out[id] = guid;
+    }
+    return out;
+}
+
 static std::string handle_export_midi_note_events(const std::string& json)
 {
-    std::string projectPath = trim_quotes(json_extract_string(json, "projectPath"));
-    std::string projectGuid = trim_quotes(json_extract_string(json, "projectGuid"));
+    std::string requestedProjectPath = trim_quotes(json_extract_string(json, "projectPath"));
+    std::string requestedProjectGuid = trim_quotes(json_extract_string(json, "projectGuid"));
 
     ReaProject* proj = nullptr;
-    if (!projectGuid.empty())
-        proj = find_open_project_by_guid(projectGuid);
-    if (!proj && !projectPath.empty())
-        proj = open_or_select_project(projectPath);
+    if (!requestedProjectGuid.empty())
+        proj = find_open_project_by_guid(requestedProjectGuid);
+    if (!proj && !requestedProjectPath.empty())
+        proj = open_or_select_project(requestedProjectPath);
     if (!proj)
         proj = EnumProjects(-1, nullptr, 0);
     if (!proj)
         return "ERR NoProject";
 
-    char projPathBuf[4096] = {0};
-    EnumProjects(-1, projPathBuf, sizeof(projPathBuf));
+    const std::string projectPath = project_path_for_project(proj);
     char songIdBuf[128] = {0};
     GetProjExtState(proj, "ZealReaperSync", "songId", songIdBuf, sizeof(songIdBuf));
     int songId = std::atoi(songIdBuf);
@@ -997,15 +1341,17 @@ static std::string handle_export_midi_note_events(const std::string& json)
     std::string projectName = trim(std::string(projNameBuf));
     if (projectName.empty())
     {
-        std::filesystem::path p(projPathBuf);
+        std::filesystem::path p(projectPath);
         projectName = p.filename().string();
     }
+
+    auto markerGuidById = marker_guid_map_from_project_file(projectPath);
 
     std::string outJson = "{";
     outJson += "\"song_id\":" + std::to_string(songId) + ",";
     outJson += "\"project_guid\":\"" + escape_json_string(std::string(guidBuf)) + "\",";
     outJson += "\"project_name\":\"" + escape_json_string(projectName) + "\",";
-    outJson += "\"project_path\":\"" + escape_json_string(std::string(projPathBuf)) + "\",";
+    outJson += "\"project_path\":\"" + escape_json_string(projectPath) + "\",";
     {
         char offsBuf[64];
         std::snprintf(offsBuf, sizeof(offsBuf), "%.6f", get_project_start_offset_seconds(proj));
@@ -1043,30 +1389,26 @@ static std::string handle_export_midi_note_events(const std::string& json)
             MediaItem* item = GetTrackMediaItem(tr, ii);
             if (!item)
                 continue;
-            const int takeCount = GetMediaItemNumTakes(item);
-            for (int tk = 0; tk < takeCount; ++tk)
-            {
-                MediaItem_Take* take = GetTake(item, tk);
-                if (!take || !TakeIsMIDI(take))
-                    continue;
-                int noteCount = 0, ccCount = 0, textCount = 0;
-                if (!MIDI_CountEvts(take, &noteCount, &ccCount, &textCount) || noteCount <= 0)
-                    continue;
+            MediaItem_Take* take = GetActiveTake(item);
+            if (!take || !TakeIsMIDI(take))
+                continue;
+            int noteCount = 0, ccCount = 0, textCount = 0;
+            if (!MIDI_CountEvts(take, &noteCount, &ccCount, &textCount) || noteCount <= 0)
+                continue;
 
-                for (int ni = 0; ni < noteCount; ++ni)
-                {
-                    bool selected = false, muted = false;
-                    double startPpq = 0.0, endPpq = 0.0;
-                    int chan = 0, pitch = 0, vel = 0;
-                    if (!MIDI_GetNote(take, ni, &selected, &muted, &startPpq, &endPpq, &chan, &pitch, &vel))
-                        continue;
-                    if (pitch < 0 || pitch > 127)
-                        continue;
-                    const double timeSec = MIDI_GetProjTimeFromPPQPos(take, startPpq);
-                    noteHits[pitch].push_back(timeSec);
-                    if (noteHits[pitch].size() == 1)
-                        noteFirstChannel[pitch] = chan;
-                }
+            for (int ni = 0; ni < noteCount; ++ni)
+            {
+                bool selected = false, muted = false;
+                double startPpq = 0.0, endPpq = 0.0;
+                int chan = 0, pitch = 0, vel = 0;
+                if (!MIDI_GetNote(take, ni, &selected, &muted, &startPpq, &endPpq, &chan, &pitch, &vel))
+                    continue;
+                if (pitch < 0 || pitch > 127)
+                    continue;
+                const double timeSec = MIDI_GetProjTimeFromPPQPos(take, startPpq);
+                noteHits[pitch].push_back(timeSec);
+                if (noteHits[pitch].size() == 1)
+                    noteFirstChannel[pitch] = chan;
             }
         }
 
@@ -1150,7 +1492,14 @@ static std::string handle_export_midi_note_events(const std::string& json)
         outJson += "{";
         outJson += "\"name\":\"" + escape_json_string(name ? std::string(name) : std::string()) + "\",";
         outJson += "\"time_sec\":" + std::string(posBuf) + ",";
-        outJson += "\"color_hex\":\"" + escape_json_string(color_native_to_hex(colorRaw)) + "\"";
+        outJson += "\"color_hex\":\"" + escape_json_string(color_native_to_hex(colorRaw)) + "\",";
+        std::string markerGuid;
+        auto itGuid = markerGuidById.find(idnum);
+        if (itGuid != markerGuidById.end())
+            markerGuid = itGuid->second;
+        if (markerGuid.empty())
+            markerGuid = "MARKER-" + std::to_string(idnum);
+        outJson += "\"marker_guid\":\"" + escape_json_string(markerGuid) + "\"";
         outJson += "}";
     }
     outJson += "]";
@@ -1568,20 +1917,79 @@ static std::string handle_get_markers()
             continue;
         if (isrgn) continue;
         std::string guid = marker_guid_for_index(proj, i);
+        std::string colorCode = color_native_to_code(color);
         if (!first) json += ",";
         first = false;
-        char buf[512];
-        std::snprintf(buf, sizeof(buf),
-                      "{\"marker_index\":%d,\"guid\":\"%s\",\"pos_sec\":%.6f,\"name\":\"%s\",\"color_raw\":%d}",
-                      idnum,
-                      guid.c_str(),
-                      pos,
-                      name ? name : "",
+        char prefix[128];
+        std::snprintf(prefix, sizeof(prefix),
+                      "{\"marker_index\":%d,\"guid\":\"",
+                      idnum);
+        json += prefix;
+        json += escape_json_string(guid);
+        char middle[96];
+        std::snprintf(middle, sizeof(middle),
+                      "\",\"pos_sec\":%.6f,\"name\":\"",
+                      pos);
+        json += middle;
+        json += escape_json_string(name ? name : "");
+        char suffix[128];
+        std::snprintf(suffix, sizeof(suffix),
+                      "\",\"color_raw\":%d,\"color_code\":\"",
                       color);
-        json += buf;
+        json += suffix;
+        json += escape_json_string(colorCode);
+        json += "\"}";
     }
     json += "]";
     return "OK " + json;
+}
+
+static std::string current_marker_snapshot_json()
+{
+    ReaProject* proj = EnumProjects(-1, nullptr, 0);
+    if (!proj)
+        return "[]";
+
+    int numMarkers=0, numRegions=0;
+    CountProjectMarkers(proj, &numMarkers, &numRegions);
+    int total = numMarkers + numRegions;
+    std::string json = "[";
+    bool first = true;
+    for (int i = 0; i < total; ++i)
+    {
+        bool isrgn=false;
+        double pos=0.0, end=0.0;
+        const char* name=nullptr;
+        int idnum=0, color=0;
+        if (!EnumProjectMarkers3(proj, i, &isrgn, &pos, &end, &name, &idnum, &color))
+            continue;
+        if (isrgn) continue;
+        std::string guid = marker_guid_for_index(proj, i);
+        std::string colorCode = color_native_to_code(color);
+        if (!first) json += ",";
+        first = false;
+        char prefix[128];
+        std::snprintf(prefix, sizeof(prefix),
+                      "{\"marker_index\":%d,\"guid\":\"",
+                      idnum);
+        json += prefix;
+        json += escape_json_string(guid);
+        char middle[96];
+        std::snprintf(middle, sizeof(middle),
+                      "\",\"pos_sec\":%.6f,\"name\":\"",
+                      pos);
+        json += middle;
+        json += escape_json_string(name ? name : "");
+        char suffix[128];
+        std::snprintf(suffix, sizeof(suffix),
+                      "\",\"color_raw\":%d,\"color_code\":\"",
+                      color);
+        json += suffix;
+        json += escape_json_string(colorCode);
+        json += "\"}";
+    }
+    json += "]";
+    return json;
 }
 
 static uint32_t color_code_to_native(const std::string& colorCode)
@@ -1627,7 +2035,7 @@ static std::string handle_get_playhead()
     ReaProject* proj = EnumProjects(-1, nullptr, 0);
     if (!proj)
         return "ERR NoProject";
-    const double playheadSec = GetCursorPosition();
+    const double playheadSec = GetPlayPositionEx(proj);
     char buf[160];
     std::snprintf(buf, sizeof(buf), "OK {\"playhead_sec\":%.6f}", playheadSec < 0.0 ? 0.0 : playheadSec);
     return std::string(buf);
@@ -1657,7 +2065,11 @@ static std::string handle_create_note_marker(const std::string& json)
     const int enumIdx = find_marker_enum_index_by_idnum(proj, markerId);
     std::string guid;
     if (enumIdx >= 0)
+    {
         guid = marker_guid_for_index(proj, enumIdx);
+        // Re-apply values by index to ensure color survives on all REAPER builds.
+        SetProjectMarkerByIndex2(proj, enumIdx, false, posSec, 0.0, markerId, name.c_str(), colorNative, 0);
+    }
 
     char out[1024];
     std::snprintf(
@@ -1781,6 +2193,7 @@ static void handle_client(int client_fd)
     std::string buffer;
     char tmp[1024];
     bool exitAfterResponse = false;
+    bool subscribedToMarkers = false;
 
     for (;;)
     {
@@ -1806,6 +2219,7 @@ static void handle_client(int client_fd)
             bool needsResponse = command_needs_response(line);
             if (needsResponse)
             {
+                bool isSubscription = is_marker_subscription_command(line);
                 auto cmd = std::make_shared<QueuedCommand>();
                 cmd->raw = line;
                 cmd->needs_response = true;
@@ -1820,8 +2234,19 @@ static void handle_client(int client_fd)
                 reply.push_back('\n');
                 send(client_fd, reply.c_str(), reply.size(), 0);
 
-                exitAfterResponse = true;
-                break;
+                if (isSubscription && reply.rfind("OK", 0) == 0)
+                {
+                    subscribedToMarkers = true;
+                    add_marker_subscriber(client_fd);
+                    std::string eventLine = format_marker_event_line(current_marker_snapshot_json());
+                    eventLine.push_back('\n');
+                    send(client_fd, eventLine.c_str(), eventLine.size(), 0);
+                }
+                else
+                {
+                    exitAfterResponse = true;
+                    break;
+                }
             }
             else
             {
@@ -1832,6 +2257,8 @@ static void handle_client(int client_fd)
         }
     }
 
+    if (subscribedToMarkers)
+        remove_marker_subscriber(client_fd);
     close(client_fd);
 }
 
@@ -1879,7 +2306,7 @@ static void server_thread_fn()
                 break;
             continue;
         }
-        handle_client(client_fd);
+        std::thread(handle_client, client_fd).detach();
     }
 
     if (listen_fd >= 0)
@@ -2001,6 +2428,48 @@ static void fulfill_response(const std::shared_ptr<QueuedCommand>& req,
 
 static void my_timer()
 {
+    auto now = std::chrono::steady_clock::now();
+    bool shouldBroadcastMarkers = false;
+    {
+        std::lock_guard<std::mutex> lock(g_markerSubscriberMutex);
+        shouldBroadcastMarkers = !g_markerSubscribers.empty();
+    }
+    if (shouldBroadcastMarkers &&
+        (g_lastMarkerBroadcastAt.time_since_epoch().count() == 0 ||
+         now - g_lastMarkerBroadcastAt >= std::chrono::seconds(1)))
+    {
+        std::string snapshotJson = current_marker_snapshot_json();
+        if (snapshotJson != g_lastMarkerSnapshotJson)
+        {
+            std::string line = format_marker_event_line(snapshotJson);
+            line.push_back('\n');
+
+            std::vector<int> stale;
+            {
+                std::lock_guard<std::mutex> lock(g_markerSubscriberMutex);
+                for (int fd : g_markerSubscribers)
+                {
+                    if (send(fd, line.c_str(), line.size(), 0) < 0)
+                        stale.push_back(fd);
+                }
+                if (!stale.empty())
+                {
+                    g_markerSubscribers.erase(
+                        std::remove_if(
+                            g_markerSubscribers.begin(),
+                            g_markerSubscribers.end(),
+                            [&stale](int fd) {
+                                return std::find(stale.begin(), stale.end(), fd) != stale.end();
+                            }),
+                        g_markerSubscribers.end()
+                    );
+                }
+            }
+            g_lastMarkerSnapshotJson = snapshotJson;
+        }
+        g_lastMarkerBroadcastAt = now;
+    }
+
     for (;;)
     {
         std::shared_ptr<QueuedCommand> req;
@@ -2059,10 +2528,40 @@ static void my_timer()
             responded = true;
             response = handle_create_note_marker(args);
         }
+        else if (verb == "RS_SUBSCRIBE_MARKERS")
+        {
+            responded = true;
+            response = "OK SUBSCRIBED";
+        }
         else if (verb == "RS_GOTO_AND_PLAY")
         {
             responded = true;
             response = handle_goto_and_play(args);
+        }
+        else if (verb == "RS_FIND_PROJECT")
+        {
+            responded = true;
+            response = handle_find_project(args);
+        }
+        else if (verb == "RS_ARM_REHEARSAL")
+        {
+            responded = true;
+            response = handle_arm_rehearsal(args);
+        }
+        else if (verb == "RS_STOP_REHEARSAL")
+        {
+            responded = true;
+            response = handle_stop_rehearsal(args);
+        }
+        else if (verb == "RS_SET_REHEARSAL_MODE")
+        {
+            responded = true;
+            response = handle_set_rehearsal_mode(args);
+        }
+        else if (verb == "RS_IMPORT_VIDEO_TO_TRACK")
+        {
+            responded = true;
+            response = handle_import_video_to_track(args);
         }
         else if (verb == "RS_EXTSTATE_GET_ZRS_LINKS")
         {
